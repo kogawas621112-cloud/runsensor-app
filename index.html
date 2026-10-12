@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RunSensor</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111;background:#f4f6f8}
+body{margin:0;padding:16px}
+.wrap{max-width:760px;margin:0 auto}
+.card{background:#fff;border-radius:18px;padding:18px;margin-bottom:14px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
+h1{font-size:34px;margin:0 0 14px}
+h2{font-size:22px;margin:0 0 12px}
+.status{font-weight:700;font-size:18px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+button{font-size:17px;min-height:56px;border:0;border-radius:14px;padding:10px;background:#e8edf2}
+button.primary{background:#1565c0;color:#fff}
+button.danger{background:#d96a6a;color:#fff}
+button.warning{background:#f0b34d;color:#111}
+button.delete{background:#4b5563;color:#fff}
+button:disabled{opacity:.38}
+.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.metric{padding:14px;border-radius:14px;background:#f7f8fa}
+.metric .v{font-size:24px;font-weight:700}
+.metric .k{font-size:13px;color:#666}
+canvas{width:100%;height:240px;border:1px solid #ddd;border-radius:10px;background:#fff}
+.small{font-size:13px;color:#666;line-height:1.5}
+#log{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;max-height:220px;overflow:auto;background:#0f1720;color:#dce7f0;border-radius:10px;padding:10px;min-height:100px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="card">
+  <h1>RunSensor</h1>
+  <div id="status" class="status">未接続</div>
+  <div class="grid">
+    <button id="connectBtn" class="primary" onclick="connectBLE()">BLE接続</button>
+    <button id="disconnectBtn" onclick="disconnectBLE()" disabled>切断</button>
+
+    <button id="startBtn" onclick="startRecording()" disabled>計測 START</button>
+    <button id="stopBtn" class="danger" onclick="stopRecording()" disabled>STOP</button>
+
+    <button id="downloadBtn" onclick="downloadData()" disabled>データ取得</button>
+    <button id="cancelDownloadBtn" class="warning" onclick="cancelDownload()" disabled>DOWNLOAD停止</button>
+
+    <button id="clearFlashBtn" class="delete" onclick="clearFlash()" disabled>保存データ削除</button>
+    <button onclick="clearScreen()">画面データ消去</button>
+
+    <button id="csvBtn" onclick="exportCSV()" disabled>CSV保存</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>受信状況</h2>
+  <div class="metrics">
+    <div class="metric"><div id="sampleCount" class="v">0</div><div class="k">受信サンプル</div></div>
+    <div class="metric"><div id="duration" class="v">0.00 s</div><div class="k">計測時間</div></div>
+    <div class="metric"><div id="maxG" class="v">-</div><div class="k">最大加速度合成 [g]</div></div>
+    <div class="metric"><div id="cadence" class="v">-</div><div class="k">推定ケイデンス [steps/min]</div></div>
+  </div>
+  <p id="downloadState" class="small">DOWNLOAD待機中</p>
+</div>
+
+<div class="card">
+  <h2>加速度合成</h2>
+  <canvas id="chart" width="900" height="320"></canvas>
+  <p class="small">赤点は簡易接地候補です。判定条件は今後調整できます。</p>
+</div>
+
+<div class="card">
+  <h2>ログ</h2>
+  <div id="log"></div>
+</div>
+
+</div>
+
+<script>
+"use strict";
+
+var SERVICE_UUID = "12345678-1234-1234-1234-1234567890ab";
+var CONTROL_UUID = "12345678-1234-1234-1234-1234567890af";
+var DATA_UUID    = "12345678-1234-1234-1234-1234567890b0";
+
+var device = null;
+var server = null;
+var controlChar = null;
+var dataChar = null;
+
+var samples = [];
+var downloadTimer = null;
+var downloading = false;
+
+var statusEl = document.getElementById("status");
+var logEl = document.getElementById("log");
+
+var connectBtn = document.getElementById("connectBtn");
+var disconnectBtn = document.getElementById("disconnectBtn");
+var startBtn = document.getElementById("startBtn");
+var stopBtn = document.getElementById("stopBtn");
+var downloadBtn = document.getElementById("downloadBtn");
+var cancelDownloadBtn = document.getElementById("cancelDownloadBtn");
+var clearFlashBtn = document.getElementById("clearFlashBtn");
+var csvBtn = document.getElementById("csvBtn");
+
+var sampleCountEl = document.getElementById("sampleCount");
+var durationEl = document.getElementById("duration");
+var maxGEl = document.getElementById("maxG");
+var cadenceEl = document.getElementById("cadence");
+var downloadStateEl = document.getElementById("downloadState");
+
+var canvas = document.getElementById("chart");
+var ctx = canvas.getContext("2d");
+
+function log(msg){
+  var now = new Date().toLocaleTimeString();
+  logEl.textContent += "[" + now + "] " + msg + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setConnectedUI(connected){
+  connectBtn.disabled = connected;
+  disconnectBtn.disabled = !connected;
+  startBtn.disabled = !connected;
+  stopBtn.disabled = !connected;
+  downloadBtn.disabled = !connected;
+  clearFlashBtn.disabled = !connected;
+
+  if(!connected){
+    cancelDownloadBtn.disabled = true;
+  }
+}
+
+async function connectBLE(){
+  log("BLE接続ボタンが押されました");
+
+  try{
+    if(!navigator.bluetooth){
+      throw new Error("navigator.bluetooth がありません。Bluefyで開いてください。");
+    }
+
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [SERVICE_UUID]
+    });
+
+    log("選択: " + (device.name || "(名前なし)"));
+
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    statusEl.textContent = "接続中...";
+    server = await device.gatt.connect();
+
+    var service = await server.getPrimaryService(SERVICE_UUID);
+
+    controlChar = await service.getCharacteristic(CONTROL_UUID);
+    dataChar = await service.getCharacteristic(DATA_UUID);
+
+    await dataChar.startNotifications();
+    dataChar.addEventListener("characteristicvaluechanged", onData);
+
+    statusEl.textContent = "接続済み: " + (device.name || "RunSensor");
+    setConnectedUI(true);
+
+    log("BLE接続完了");
+  }catch(err){
+    statusEl.textContent = "接続失敗";
+    log("接続エラー: " + (err.message || String(err)));
+  }
+}
+
+function disconnectBLE(){
+  if(device && device.gatt && device.gatt.connected){
+    device.gatt.disconnect();
+  }
+}
+
+function onDisconnected(){
+  statusEl.textContent = "未接続";
+  setConnectedUI(false);
+  downloading = false;
+  log("BLE切断");
+}
+
+async function writeCommand(command){
+  if(!controlChar){
+    log("未接続です");
+    return;
+  }
+
+  var bytes = new TextEncoder().encode(command);
+
+  try{
+    await controlChar.writeValue(bytes);
+    log("送信: " + command);
+  }catch(err){
+    log("Write失敗: " + (err.message || String(err)));
+  }
+}
+
+async function startRecording(){
+  clearScreen();
+  downloadStateEl.textContent = "計測開始要求";
+  await writeCommand("START");
+}
+
+async function stopRecording(){
+  await writeCommand("STOP");
+  downloadStateEl.textContent = "計測停止。データ取得できます";
+}
+
+async function downloadData(){
+  clearScreen();
+
+  downloading = true;
+  cancelDownloadBtn.disabled = false;
+  downloadBtn.disabled = true;
+
+  downloadStateEl.textContent = "DOWNLOAD中...";
+  log("DOWNLOAD開始");
+
+  await writeCommand("DOWNLOAD");
+  resetDownloadTimer();
+}
+
+async function cancelDownload(){
+  if(!downloading){
+    return;
+  }
+
+  log("DOWNLOAD停止要求");
+  await writeCommand("CANCEL");
+
+  downloading = false;
+  cancelDownloadBtn.disabled = true;
+  downloadBtn.disabled = false;
+
+  if(downloadTimer){
+    clearTimeout(downloadTimer);
+    downloadTimer = null;
+  }
+
+  downloadStateEl.textContent =
+    "DOWNLOAD停止: " + samples.length + " samples受信";
+
+  // 途中までのデータでも確認・CSV保存できるようにする
+  analyze();
+  drawChart();
+  csvBtn.disabled = samples.length === 0;
+}
+
+async function clearFlash(){
+  if(downloading){
+    alert("DOWNLOADを先に停止してください。");
+    return;
+  }
+
+  var ok = confirm(
+    "RunSensor本体に保存されている計測データを削除します。\n" +
+    "削除したデータは元に戻せません。\n\n" +
+    "削除しますか？"
+  );
+
+  if(!ok){
+    log("保存データ削除をキャンセル");
+    return;
+  }
+
+  await writeCommand("CLEAR");
+
+  clearScreen();
+  downloadStateEl.textContent = "保存データ削除要求を送信しました";
+  log("本体Flashの保存データ削除要求");
+}
+
+function resetDownloadTimer(){
+  if(downloadTimer){
+    clearTimeout(downloadTimer);
+  }
+
+  if(!downloading) return;
+
+  downloadTimer = setTimeout(function(){
+    downloading = false;
+    cancelDownloadBtn.disabled = true;
+    downloadBtn.disabled = false;
+
+    downloadStateEl.textContent =
+      "DOWNLOAD完了: " + samples.length + " samples";
+
+    log("DOWNLOAD完了と判断: " + samples.length + " samples");
+
+    analyze();
+    drawChart();
+    csvBtn.disabled = samples.length === 0;
+  }, 1500);
+}
+
+function onData(event){
+  var view = event.target.value;
+
+  if(view.byteLength < 18){
+    return;
+  }
+
+  var seq = view.getUint16(0, true);
+  var timeUs = view.getUint32(2, true);
+
+  var ax = view.getInt16(6, true) / 1000.0;
+  var ay = view.getInt16(8, true) / 1000.0;
+  var az = view.getInt16(10, true) / 1000.0;
+
+  var gx = view.getInt16(12, true) / 10.0;
+  var gy = view.getInt16(14, true) / 10.0;
+  var gz = view.getInt16(16, true) / 10.0;
+
+  var amag = Math.sqrt(ax*ax + ay*ay + az*az);
+  var gmag = Math.sqrt(gx*gx + gy*gy + gz*gz);
+
+  samples.push({
+    seq:seq,
+    timeUs:timeUs,
+    ax:ax, ay:ay, az:az,
+    gx:gx, gy:gy, gz:gz,
+    amag:amag,
+    gmag:gmag
+  });
+
+  sampleCountEl.textContent = samples.length;
+
+  if(samples.length > 1){
+    durationEl.textContent = getDurationSeconds().toFixed(2) + " s";
+  }
+
+  if(downloading){
+    downloadStateEl.textContent =
+      "DOWNLOAD中... " + samples.length + " samples";
+    resetDownloadTimer();
+  }
+
+  if(samples.length % 100 === 0){
+    drawChart();
+  }
+}
+
+function unsignedDiff32(curr, prev){
+  return (curr - prev) >>> 0;
+}
+
+function getRelativeTimes(){
+  if(samples.length === 0) return [];
+
+  var t = [0];
+
+  for(var i=1; i<samples.length; i++){
+    var dtUs = unsignedDiff32(
+      samples[i].timeUs,
+      samples[i-1].timeUs
+    );
+
+    t.push(t[i-1] + dtUs / 1000000.0);
+  }
+
+  return t;
+}
+
+function getDurationSeconds(){
+  var t = getRelativeTimes();
+  return t.length ? t[t.length-1] : 0;
+}
+
+function movingAverage(values, windowSize){
+  var out = new Array(values.length).fill(0);
+  var sum = 0;
+
+  for(var i=0; i<values.length; i++){
+    sum += values[i];
+
+    if(i >= windowSize){
+      sum -= values[i-windowSize];
+    }
+
+    var n = Math.min(i+1, windowSize);
+    out[i] = sum / n;
+  }
+
+  return out;
+}
+
+function detectPeaks(values, fs){
+  var minDistance = Math.round(0.35 * fs);
+  var threshold = 1.25;
+
+  var peaks = [];
+  var lastPeak = -minDistance;
+
+  for(var i=1; i<values.length-1; i++){
+    var localMax =
+      values[i] > values[i-1] &&
+      values[i] >= values[i+1];
+
+    if(!localMax) continue;
+    if(values[i] < threshold) continue;
+    if(i - lastPeak < minDistance) continue;
+
+    peaks.push(i);
+    lastPeak = i;
+  }
+
+  return peaks;
+}
+
+function analyze(){
+  if(samples.length === 0) return;
+
+  var times = getRelativeTimes();
+  var amag = samples.map(function(s){ return s.amag; });
+
+  maxGEl.textContent =
+    Math.max.apply(null, amag).toFixed(2);
+
+  var smooth = movingAverage(amag, 5);
+  var peaks = detectPeaks(smooth, 100);
+
+  if(peaks.length >= 2){
+    var intervals = [];
+
+    for(var i=1; i<peaks.length; i++){
+      intervals.push(
+        times[peaks[i]] - times[peaks[i-1]]
+      );
+    }
+
+    intervals.sort(function(a,b){ return a-b; });
+
+    var median =
+      intervals[Math.floor(intervals.length/2)];
+
+    var cadence = 2 * 60 / median;
+
+    cadenceEl.textContent =
+      isFinite(cadence) ? cadence.toFixed(0) : "-";
+
+    log(
+      "解析: peaks=" + peaks.length +
+      ", median=" + median.toFixed(3) + " s" +
+      ", cadence≈" + cadence.toFixed(1) + " spm"
+    );
+  }else{
+    cadenceEl.textContent = "-";
+    log("接地候補が十分に検出できませんでした");
+  }
+}
+
+function drawChart(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if(samples.length < 2){
+    ctx.fillStyle = "#111";
+    ctx.font = "18px sans-serif";
+    ctx.fillText("データなし",20,30);
+    return;
+  }
+
+  var times = getRelativeTimes();
+  var values =
+    movingAverage(
+      samples.map(function(s){ return s.amag; }),
+      5
+    );
+
+  var ymin = Math.min.apply(null, values);
+  var ymax = Math.max.apply(null, values);
+
+  if(Math.abs(ymax-ymin) < 0.1){
+    ymin -= 0.05;
+    ymax += 0.05;
+  }
+
+  var left=55, right=15, top=15, bottom=35;
+  var w=canvas.width-left-right;
+  var h=canvas.height-top-bottom;
+  var tmax=times[times.length-1] || 1;
+
+  function X(t){ return left + (t/tmax)*w; }
+  function Y(v){ return top + (ymax-v)/(ymax-ymin)*h; }
+
+  ctx.strokeStyle="#999";
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.moveTo(left,top);
+  ctx.lineTo(left,top+h);
+  ctx.lineTo(left+w,top+h);
+  ctx.stroke();
+
+  ctx.strokeStyle="#1565c0";
+  ctx.lineWidth=2;
+  ctx.beginPath();
+
+  for(var i=0;i<values.length;i++){
+    var x=X(times[i]);
+    var y=Y(values[i]);
+
+    if(i===0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+  }
+
+  ctx.stroke();
+
+  var peaks=detectPeaks(values,100);
+
+  ctx.fillStyle="#c62828";
+
+  for(var p=0;p<peaks.length;p++){
+    var idx=peaks[p];
+
+    ctx.beginPath();
+    ctx.arc(
+      X(times[idx]),
+      Y(values[idx]),
+      4,
+      0,
+      Math.PI*2
+    );
+    ctx.fill();
+  }
+
+  ctx.fillStyle="#111";
+  ctx.font="18px sans-serif";
+  ctx.fillText("a_mag [g]",5,22);
+  ctx.fillText("0 s",left-5,canvas.height-8);
+  ctx.fillText(
+    tmax.toFixed(1)+" s",
+    canvas.width-70,
+    canvas.height-8
+  );
+}
+
+function exportCSV(){
+  if(samples.length === 0) return;
+
+  var times=getRelativeTimes();
+
+  var lines=[
+    "time_s,seq,device_time_us,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,a_mag_g,g_mag_dps"
+  ];
+
+  for(var i=0;i<samples.length;i++){
+    var s=samples[i];
+
+    lines.push([
+      times[i].toFixed(6),
+      s.seq,
+      s.timeUs,
+      s.ax.toFixed(4),
+      s.ay.toFixed(4),
+      s.az.toFixed(4),
+      s.gx.toFixed(2),
+      s.gy.toFixed(2),
+      s.gz.toFixed(2),
+      s.amag.toFixed(4),
+      s.gmag.toFixed(2)
+    ].join(","));
+  }
+
+  var blob=
+    new Blob(
+      [lines.join("\n")],
+      {type:"text/csv;charset=utf-8"}
+    );
+
+  var url=URL.createObjectURL(blob);
+
+  var a=document.createElement("a");
+
+  a.href=url;
+  a.download=
+    "RunSensor_" +
+    new Date().toISOString().replace(/[:.]/g,"-") +
+    ".csv";
+
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  setTimeout(function(){
+    URL.revokeObjectURL(url);
+  },1000);
+
+  log("CSV出力");
+}
+
+function clearScreen(){
+  samples=[];
+  sampleCountEl.textContent="0";
+  durationEl.textContent="0.00 s";
+  maxGEl.textContent="-";
+  cadenceEl.textContent="-";
+  csvBtn.disabled=true;
+  drawChart();
+}
+
+(function boot(){
+  log("JavaScript起動OK");
+  log("navigator.bluetooth: " + (navigator.bluetooth ? "あり" : "なし"));
+  drawChart();
+})();
+</script>
+</body>
+</html>
